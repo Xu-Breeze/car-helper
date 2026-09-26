@@ -3,6 +3,7 @@ import DOMPurify from 'dompurify'
 import { marked } from 'marked'
 
 import {
+  deleteSession,
   getSessionHistory,
   getSessionMessages,
   sendChatMessage,
@@ -10,6 +11,7 @@ import {
   type Message as StoredMessage,
   type Session
 } from '@/utils/api'
+import { ConfirmDialog } from './ConfirmDialog'
 import { MemoryPanel } from './MemoryPanel'
 
 marked.setOptions({ breaks: true, gfm: true })
@@ -96,6 +98,14 @@ function writeCachedMessages(sessionId: string, messages: ConversationMessage[])
     localStorage.setItem(cacheKey(sessionId), JSON.stringify({ messages, timestamp: Date.now() }))
   } catch (error) {
     console.error('Failed to cache conversation:', error)
+  }
+}
+
+function clearCachedMessages(sessionId: string): void {
+  try {
+    localStorage.removeItem(cacheKey(sessionId))
+  } catch (error) {
+    console.error('Failed to clear cached conversation:', error)
   }
 }
 
@@ -264,6 +274,10 @@ export function SearchInterface() {
   const [isHistoryLoading, setIsHistoryLoading] = useState(false)
   const [sessions, setSessions] = useState<Session[]>([])
   const [showHistory, setShowHistory] = useState(false)
+  const [pendingDelete, setPendingDelete] = useState<Session | null>(null)
+  const [isDeleting, setIsDeleting] = useState(false)
+  const [deleteError, setDeleteError] = useState('')
+  const [memoryRefreshToken, setMemoryRefreshToken] = useState(0)
   const [expandedReasoning, setExpandedReasoning] = useState<Set<string>>(new Set())
   const historyRef = useRef<HTMLDivElement>(null)
 
@@ -368,6 +382,8 @@ export function SearchInterface() {
       writeCachedMessages(activeSessionId, failed)
     } finally {
       setIsStreaming(false)
+      // 这一轮可能新增或删除了长期记忆，让 Memory 按钮上的计数重新拉取。
+      setMemoryRefreshToken(current => current + 1)
     }
   }
 
@@ -410,15 +426,51 @@ export function SearchInterface() {
     }
   }
 
-  const startNewConversation = () => {
-    if (isStreaming) return
+  const resetConversation = () => {
     const newSessionId = createSessionId()
     localStorage.setItem(CURRENT_SESSION_KEY, newSessionId)
     setSessionId(newSessionId)
     setMessages([])
     setSearchQuery('')
     setExpandedReasoning(new Set())
+  }
+
+  const startNewConversation = () => {
+    if (isStreaming) return
+    resetConversation()
     setShowHistory(false)
+  }
+
+  const openDeleteConfirm = (session: Session) => {
+    setDeleteError('')
+    setPendingDelete(session)
+  }
+
+  const closeDeleteConfirm = () => {
+    if (isDeleting) return
+    setPendingDelete(null)
+    setDeleteError('')
+  }
+
+  const confirmDeleteSession = async () => {
+    if (!pendingDelete || isDeleting) return
+    const target = pendingDelete
+    setIsDeleting(true)
+    setDeleteError('')
+    try {
+      await deleteSession(target.id)
+      clearCachedMessages(target.id)
+      // Removes the conversation only; long-term memories survive because the
+      // backend stores them in a separate table with ON DELETE SET NULL.
+      setSessions(current => current.filter(session => session.id !== target.id))
+      if (target.id === sessionId) resetConversation()
+      setPendingDelete(null)
+    } catch (error) {
+      console.error('Failed to delete session:', error)
+      setDeleteError('会话删除失败，请稍后重试。')
+    } finally {
+      setIsDeleting(false)
+    }
   }
 
   const toggleReasoning = (messageId: string) => {
@@ -450,27 +502,54 @@ export function SearchInterface() {
             {sessions.length === 0 ? (
               <p className="px-4 py-6 text-sm text-muted-foreground">暂无历史会话</p>
             ) : (
-              sessions.map((session, index) => (
-                <button
-                  type="button"
-                  key={session.id}
-                  onClick={() => void resumeSession(session.id)}
-                  className="w-full grid grid-cols-[auto_1fr_auto] gap-4 items-center px-4 py-4 text-left hover:bg-muted transition-colors border-b border-border last:border-b-0"
-                >
-                  <span className="text-xs font-semibold text-muted-foreground">
-                    {String(index + 1).padStart(2, '0')}
-                  </span>
-                  <span className="text-sm truncate">
-                    {session.title || session.last_query || '(Untitled)'}
-                  </span>
-                  <span className="text-xs text-muted-foreground whitespace-nowrap">
-                    {formatTime(session.update_time)}
-                  </span>
-                </button>
-              ))
+              sessions.map((session, index) => {
+                const label = session.title || session.last_query || '(Untitled)'
+                return (
+                  <div
+                    key={session.id}
+                    className="grid grid-cols-[auto_1fr_auto_auto] gap-4 items-center px-4 py-4 hover:bg-muted transition-colors border-b border-border last:border-b-0"
+                  >
+                    <span className="text-xs font-semibold text-muted-foreground">
+                      {String(index + 1).padStart(2, '0')}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => void resumeSession(session.id)}
+                      disabled={isStreaming || isHistoryLoading}
+                      className="min-w-0 truncate text-left text-sm disabled:opacity-50"
+                    >
+                      {label}
+                    </button>
+                    <span className="text-xs text-muted-foreground whitespace-nowrap">
+                      {formatTime(session.update_time)}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => openDeleteConfirm(session)}
+                      disabled={isStreaming || isHistoryLoading || isDeleting}
+                      aria-label={`删除会话：${label}`}
+                      title="删除该会话"
+                      className="w-6 h-6 flex items-center justify-center border border-transparent text-base leading-none text-muted-foreground hover:border-border hover:text-foreground disabled:opacity-40 transition-colors"
+                    >
+                      ×
+                    </button>
+                  </div>
+                )
+              })
             )}
           </div>
         </div>
+      )}
+      {pendingDelete && (
+        <ConfirmDialog
+          title="Delete conversation"
+          message="删除后该会话的对话记录将从历史中移除，且无法恢复；长期记忆不受影响。"
+          detail={pendingDelete.title || pendingDelete.last_query || '(Untitled)'}
+          busy={isDeleting}
+          error={deleteError}
+          onConfirm={() => void confirmDeleteSession()}
+          onCancel={closeDeleteConfirm}
+        />
       )}
     </div>
   )
@@ -496,7 +575,7 @@ export function SearchInterface() {
               </div>
             )}
             <div className="flex items-center gap-2">
-              <MemoryPanel />
+              <MemoryPanel refreshToken={memoryRefreshToken} />
               {historyMenu}
             </div>
           </div>

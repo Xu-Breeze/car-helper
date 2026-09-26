@@ -12,11 +12,14 @@ htmlcov/
 *.egg-info/
 dist/
 build/
+.venv/
+venv/
 
 # Local project instructions and non-release documents
 *.md
 !README.md
 !frontend/README.md
+!CHANGELOG.md
 
 # Local source datasets and generated reports
 src/pipeline/entities/

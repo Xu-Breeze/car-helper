@@ -8,9 +8,11 @@ flag so an accidental import cannot clear the graph.
 import argparse
 import csv
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from src.db.model_schema import is_missing, normalize_model
 from src.db.neo4j_conn import Neo4jConnection
 
 
@@ -159,10 +161,10 @@ def load_and_validate_data():
         model_field="left",
         relationship_name="车型-能源关系",
     )
+    # 判定口径与写入口径共用 ``is_missing``，避免这里手写一份哨兵集合、
+    # 与导入时的清洗规则悄悄走偏。
     priced_models = [
-        model
-        for model in models
-        if model.get("官方指导价") not in {None, "", "NONE", "None", "暂无", "暂无报价"}
+        model for model in models if not is_missing(model.get("官方指导价"))
     ]
     model_prices = _attach_model_ids(
         priced_models,
@@ -193,6 +195,26 @@ def load_and_validate_data():
             if row["left"] in left_values and row["right"] in right_values
         ]
 
+    # 车型属性在这里统一规范化，之后才交给写库逻辑：
+    # 数值字段拆成可比较的 ASCII 规范化属性，缺失哨兵一律剔除（"缺失"在库里
+    # 只剩"属性不存在"一种表示），能源类型以关系文件为准写成 5 类规范值、
+    # 原始细分写法另存 energy_raw。关系行在上面已通过引用校验，因此
+    # model_id -> 能源类别 这个映射可以放心当作权威来源。
+    energy_by_model = {
+        row["model_id"]: row["right"] for row in validated_relationships["model_energy"]
+    }
+    models_without_energy = [
+        model["_source_id"]
+        for model in models
+        if not energy_by_model.get(model["_source_id"])
+    ]
+    if models_without_energy:
+        warnings.append(f"车型缺少能源类别：{len(models_without_energy)} 条")
+    models = [
+        normalize_model(model, energy_canonical=energy_by_model.get(model["_source_id"]))
+        for model in models
+    ]
+
     return DataBundle(
         brands,
         series,
@@ -212,36 +234,65 @@ def _batches(items, batch_size):
         yield items[start : start + batch_size]
 
 
+# 查询层真正依赖的规范化字段。导入时把有值条数打出来，契约有没有生效一眼可见，
+# 不用等到查询返回空值才发现语义没对上。
+REPORTED_FIELDS = (
+    "能源类型",
+    "price_wan",
+    "launch_ym",
+    "range_cltc_km",
+    "accel_100_s",
+    "maintenance_60k_cost",
+)
+
+
+def canonical_coverage(models) -> list[str]:
+    total = len(models)
+    return [
+        f"  {field}: {sum(1 for model in models if field in model):,}/{total:,}"
+        for field in REPORTED_FIELDS
+    ]
+
+
 def import_data(bundle: DataBundle, *, replace: bool, batch_size: int):
+    # Each job carries a human-readable label so the progress output below can
+    # say what is being written instead of leaving the operator staring at a
+    # silent terminal for minutes. Progress is unconditional: the whole point of
+    # the change was that a silent write phase was indistinguishable from a hang.
     node_jobs = (
-        ("UNWIND $rows AS row MERGE (:品牌 {name: row})", bundle.brands),
-        ("UNWIND $rows AS row MERGE (:车系 {name: row})", bundle.series),
+        ("品牌", "UNWIND $rows AS row MERGE (:品牌 {name: row})", bundle.brands),
+        ("车系", "UNWIND $rows AS row MERGE (:车系 {name: row})", bundle.series),
         (
+            "车型",
             "UNWIND $rows AS row MERGE (m:车型 {_source_id: row._source_id}) SET m += row",
             bundle.models,
         ),
-        ("UNWIND $rows AS row MERGE (:能源类型 {name: row})", bundle.energy_types),
-        ("UNWIND $rows AS row MERGE (:价格区间 {name: row})", bundle.price_ranges),
+        ("能源类型", "UNWIND $rows AS row MERGE (:能源类型 {name: row})", bundle.energy_types),
+        ("价格区间", "UNWIND $rows AS row MERGE (:价格区间 {name: row})", bundle.price_ranges),
     )
     relationship_jobs = (
         (
+            "品牌→车系 HAS_SERIES",
             "UNWIND $rows AS row MATCH (a:品牌 {name: row.left}), (b:车系 {name: row.right}) "
             "MERGE (a)-[:HAS_SERIES]->(b)",
             bundle.brand_series,
         ),
         (
+            "车系→车型 HAS_MODEL",
             "UNWIND $rows AS row MATCH (a:车系 {name: row.left}), "
             "(b:车型 {_source_id: row.model_id}) "
             "MERGE (a)-[:HAS_MODEL]->(b)",
             bundle.series_models,
         ),
         (
+            "车型→能源 ENERGY_TYPE_IS",
             "UNWIND $rows AS row MATCH (a:车型 {_source_id: row.model_id}), "
             "(b:能源类型 {name: row.right}) "
             "MERGE (a)-[:ENERGY_TYPE_IS]->(b)",
             bundle.model_energy,
         ),
         (
+            "车型→价格 IN_PRICE_RANGE",
             "UNWIND $rows AS row MATCH (a:车型 {_source_id: row.model_id}), "
             "(b:价格区间 {name: row.right}) "
             "MERGE (a)-[:IN_PRICE_RANGE]->(b)",
@@ -250,6 +301,18 @@ def import_data(bundle: DataBundle, *, replace: bool, batch_size: int):
     )
 
     connection = Neo4jConnection()
+    # Indexes are created before the transaction is opened, and this ordering is
+    # not cosmetic: ``CREATE INDEX`` is a schema command and Neo4j rejects it if
+    # it shares a transaction with data writes. Without these indexes every
+    # MERGE/MATCH below scans the whole label, so the import slows down as the
+    # graph grows instead of staying flat.
+    connection.ensure_indexes()
+    jobs = (*node_jobs, *relationship_jobs)
+    total_rows = sum(len(rows) for _, _, rows in jobs)
+    # Every line is flushed immediately: when the output is piped to a file or
+    # watched with ``Get-Content -Wait``, buffered prints would only appear once
+    # the process ends, which is exactly the "is it stuck?" problem this
+    # progress reporting exists to remove.
     with connection.get_session() as session:
         transaction = session.begin_transaction()
         try:
@@ -266,11 +329,41 @@ def import_data(bundle: DataBundle, *, replace: bool, batch_size: int):
                     "现有车型不是由新版导入器管理；首次迁移必须显式使用 --replace。"
                 )
             if replace:
+                print("  正在清空现有图数据…", flush=True)
                 transaction.run("MATCH (n) DETACH DELETE n").consume()
-            for statement, rows in (*node_jobs, *relationship_jobs):
+                print("  清空完成。", flush=True)
+
+            written = 0
+            overall_started = time.monotonic()
+            for job_index, (label, statement, rows) in enumerate(jobs, 1):
+                total = len(rows)
+                if total == 0:
+                    print(f"[{job_index}/{len(jobs)}] {label}：无数据，跳过", flush=True)
+                    continue
+                print(f"[{job_index}/{len(jobs)}] {label}：共 {total:,} 条", flush=True)
+                job_started = time.monotonic()
+                processed = 0
                 for batch in _batches(rows, batch_size):
                     transaction.run(statement, rows=batch).consume()
+                    processed += len(batch)
+                    written += len(batch)
+                    elapsed = time.monotonic() - job_started
+                    rate = processed / elapsed if elapsed > 0 else 0.0
+                    eta = (total - processed) / rate if rate > 0 else 0.0
+                    print(
+                        f"        {processed:,}/{total:,}"
+                        f" ({processed * 100.0 / total:5.1f}%)"
+                        f"  已用 {elapsed:6.1f}s  剩余约 {eta:5.0f}s",
+                        flush=True,
+                    )
+            print(
+                f"  写入完毕 {written:,}/{total_rows:,} 条，"
+                f"耗时 {time.monotonic() - overall_started:.1f}s。"
+                "正在提交事务（提交成功后数据才对查询可见）…",
+                flush=True,
+            )
             transaction.commit()
+            print("  事务已提交。", flush=True)
         except Exception:
             transaction.rollback()
             raise
@@ -296,17 +389,22 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    print("正在读取并校验数据文件…", flush=True)
     bundle = load_and_validate_data()
-    print("数据文件校验通过：")
+    print("数据文件校验通过：", flush=True)
     for label, count in bundle.counts().items():
-        print(f"  {label}: {count:,}")
+        print(f"  {label}: {count:,}", flush=True)
+    print("车型规范化字段覆盖：", flush=True)
+    for line in canonical_coverage(bundle.models):
+        print(line, flush=True)
     for warning in bundle.warnings:
-        print(f"  警告: {warning}")
+        print(f"  警告: {warning}", flush=True)
     if not args.apply:
-        print("未提供 --apply，仅执行校验，数据库未修改。")
+        print("未提供 --apply，仅执行校验，数据库未修改。", flush=True)
         return
+    print("正在确保 Neo4j 索引存在（缺索引会让导入退化为全表扫描）…", flush=True)
     import_data(bundle, replace=args.replace, batch_size=args.batch_size)
-    print("Neo4j 导入完成。")
+    print("Neo4j 导入完成。", flush=True)
 
 
 if __name__ == "__main__":

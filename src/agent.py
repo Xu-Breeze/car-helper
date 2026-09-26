@@ -7,8 +7,45 @@ from src.session import (
     create_session_store,
     create_unique_session_id,
     resume_session,
+    select_session_for_deletion,
 )
 from src.storage import create_local_store
+
+
+COMMAND_HINT = "可用命令：/resume 恢复历史会话、/delete 删除历史会话、/exit 退出"
+
+
+async def delete_conversation(local_store, checkpointer, profile_id, current_session_id):
+    """Delete one stored conversation, keeping long-term memories intact."""
+    target_id = await asyncio.to_thread(
+        select_session_for_deletion,
+        local_store,
+        profile_id,
+    )
+    if not target_id:
+        return current_session_id
+
+    try:
+        await checkpointer.adelete_thread(target_id)
+    except Exception as exc:
+        print(f"删除会话检查点失败：{exc}")
+        return current_session_id
+
+    deleted = await asyncio.to_thread(
+        local_store.delete_conversation,
+        profile_id,
+        target_id,
+    )
+    if not deleted:
+        print("该会话记录已不存在")
+        return current_session_id
+
+    print(f"已删除会话 {target_id[:8]}...（长期记忆不受影响）")
+    if target_id == current_session_id:
+        replacement = create_unique_session_id()
+        print(f"当前会话已删除，切换到新会话 {replacement[:8]}...")
+        return replacement
+    return current_session_id
 
 
 async def stream_answer(agent, config, context, query):
@@ -66,6 +103,17 @@ async def main():
                 if restored_id:
                     session_id = restored_id
                     print(f"已恢复会话: {restored_id[:8]}...")
+                continue
+            if command == "/delete":
+                session_id = await delete_conversation(
+                    local_store,
+                    checkpointer,
+                    profile_id,
+                    session_id,
+                )
+                continue
+            if command.startswith("/"):
+                print(COMMAND_HINT)
                 continue
             if not query.strip():
                 continue

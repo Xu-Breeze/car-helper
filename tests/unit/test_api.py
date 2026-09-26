@@ -151,6 +151,30 @@ def test_invalid_session_id_is_rejected(monkeypatch):
     assert response.status_code == 422
 
 
+def test_session_delete_drops_conversation_but_keeps_memories(monkeypatch):
+    local_store, checkpointer = configure_app(monkeypatch)
+
+    with TestClient(api_module.app) as client:
+        client.post(
+            "/api/chat",
+            json={"message": "比亚迪有什么车", "session_id": "session_123"},
+        )
+        memories_before = list(local_store.memories)
+        deleted = client.delete("/api/sessions/session_123")
+        missing = client.delete("/api/sessions/session_123")
+        invalid = client.delete("/api/sessions/bad id!")
+
+    assert deleted.status_code == 200
+    assert deleted.json() == {"ok": True}
+    assert checkpointer.deleted == ["session_123"]
+    assert local_store.conversations == set()
+    # Conversations and memories live in separate tables: deleting a
+    # conversation must never remove what the user asked to remember.
+    assert local_store.memories == memories_before
+    assert missing.status_code == 404
+    assert invalid.status_code == 422
+
+
 def test_profile_and_memory_endpoints_use_local_identity(monkeypatch):
     local_store, _ = configure_app(monkeypatch)
 

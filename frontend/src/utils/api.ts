@@ -176,3 +176,10 @@ export async function deleteMemory(memoryId: string): Promise<void> {
   })
   if (!response.ok) throw new Error(`HTTP ${response.status}`)
 }
+
+export async function deleteSession(sessionId: string): Promise<void> {
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+    method: 'DELETE'
+  })
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+}

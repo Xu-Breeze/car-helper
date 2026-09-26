@@ -7,6 +7,7 @@ from typing import Annotated, Literal
 from langchain_core.tools import tool
 from pydantic import Field
 
+from src.db.model_schema import is_missing, render_missing
 from src.db.neo4j_conn import Neo4jConnection, Neo4jConnectionError
 
 
@@ -17,38 +18,35 @@ EnergyType = Literal["汽油", "纯电动", "插电式混合动力", "增程式"
 NodeType = Literal["品牌", "车系", "车型", "价格区间", "能源类型"]
 QueryLimit = Annotated[int, Field(ge=1, le=500)]
 
-_MISSING_VALUES = {None, "", "NONE", "None", "暂无", "暂无报价"}
+
+# 排序统一用规范化属性（launch_ym=YYYYMM 整数、range_cltc_km 等），并用
+# `ORDER BY 列 IS NULL, 列 DESC` 把缺失稳定压到末位：既不把字符串哨兵排到数字前面，
+# 也不依赖 Neo4j 对 null 的排序约定（实测 null 在 DESC 下排最前，会把"无上市时间"的
+# 车顶成最新）。缺失在返回给上游之前由 render_missing 按字段回显成文案。
 
 
 def _present(value):
-    return value not in _MISSING_VALUES
+    return not is_missing(value)
 
 
 def _price_bucket(record):
-    explicit_bucket = record.get("价格区间")
-    if _present(explicit_bucket):
-        return explicit_bucket
+    """价格分档：只认查询投影出来的 ``价格区间`` 关系节点名。
 
-    match = re.search(r"\d+(?:\.\d+)?", str(record.get("指导价", "")))
-    if not match:
-        return None
-    price = float(match.group())
-    if price < 10:
-        return "0-10万"
-    if price < 20:
-        return "10-20万"
-    if price < 30:
-        return "20-30万"
-    if price < 40:
-        return "30-40万"
-    if price < 50:
-        return "40-50万"
-    return "50万以上"
+    这里不再从规范化价格 ``price_wan`` 现算——没有任何查询把 ``price_wan``
+    投影出来，留一段永不生效的兜底只会让后来人误以为还有第二条路径。
+    价格有效的车 100% 带 ``IN_PRICE_RANGE`` 关系，这一条路已足够。
+    """
+    explicit_bucket = record.get("价格区间")
+    return explicit_bucket if _present(explicit_bucket) else None
 
 
 def _launch_key(record):
-    value = record.get("上市时间")
-    return str(value) if _present(value) else ""
+    """返回整数排序键，缺失记为 0；统一类型避免与字符串比较时报错。"""
+    launch = record.get("上市年月")
+    if isinstance(launch, (int, float)):
+        return int(launch)
+    digits = re.sub(r"\D", "", str(record.get("上市时间") or ""))
+    return int(digits[:6]) if len(digits) >= 6 else 0
 
 
 def stratified_sample(records: list[dict], max_count: int = 20) -> list[dict]:
@@ -158,8 +156,15 @@ async def _query_with_sample(
     validated = validate_result(raw, tool_name)
     if isinstance(validated, str):
         return validated
+    # 顺序不可颠倒：采样与统计都要看未渲染的记录（渲染后每格都是非空字符串，
+    # 判空、分档、排序键全部失效）。库侧排序已完成，渲染只影响给上游看的文案，
+    # 并额外汇报每列的缺失构成，让"哪些行排不进来"有据可查。
     sampled = validated[:max_count] if preserve_order else stratified_sample(validated, max_count)
-    return {"数据": sampled, "采样统计": sample_stats(raw, sampled)}
+    rendered, missing = render_missing(sampled)
+    result = {"数据": rendered, "采样统计": sample_stats(raw, sampled)}
+    if missing:
+        result["缺失说明"] = missing
+    return result
 
 
 @tool
@@ -173,8 +178,8 @@ async def query_by_brand(brand: str, limit: QueryLimit = 500) -> dict | str:
     RETURN DISTINCT b.name AS 品牌, s.name AS 车系, m.车名 AS 车型,
            m.`官方指导价` AS 指导价, p.name AS 价格区间,
            coalesce(e.name, m.能源类型) AS 能源类型, m.级别 AS 级别,
-           m.`上市时间` AS 上市时间
-    ORDER BY m.`上市时间` DESC, m.车名
+           m.`上市时间` AS 上市时间, m.launch_ym AS 上市年月
+    ORDER BY 上市年月 IS NULL, 上市年月 DESC, m.车名
     LIMIT $limit
     """
     return await _query_with_sample(cypher, {"brand": brand.strip(), "limit": limit}, "query_by_brand")
@@ -192,8 +197,8 @@ async def query_by_price_range(price_range: PriceRange, limit: QueryLimit = 500)
     RETURN DISTINCT b.name AS 品牌, s.name AS 车系, m.车名 AS 车型,
            m.`官方指导价` AS 指导价, p.name AS 价格区间,
            coalesce(e.name, m.能源类型) AS 能源类型, m.级别 AS 级别,
-           m.`上市时间` AS 上市时间
-    ORDER BY m.`上市时间` DESC, m.车名
+           m.`上市时间` AS 上市时间, m.launch_ym AS 上市年月
+    ORDER BY 上市年月 IS NULL, 上市年月 DESC, m.车名
     LIMIT $limit
     """
     return await _query_with_sample(
@@ -215,9 +220,9 @@ async def query_by_energy_type(energy_type: EnergyType, limit: QueryLimit = 500)
     RETURN DISTINCT b.name AS 品牌, s.name AS 车系, m.车名 AS 车型,
            m.`官方指导价` AS 指导价, p.name AS 价格区间,
            e.name AS 能源类型, m.级别 AS 级别,
-           m.`上市时间` AS 上市时间,
-           m.`纯电续航里程(km)CLTC` AS 纯电续航
-    ORDER BY toInteger(m.`纯电续航里程(km)CLTC`) DESC, m.`上市时间` DESC
+           m.`上市时间` AS 上市时间, m.launch_ym AS 上市年月,
+           m.range_cltc_km AS 纯电续航
+    ORDER BY 纯电续航 IS NULL, 纯电续航 DESC, 上市年月 IS NULL, 上市年月 DESC
     LIMIT $limit
     """
     return await _query_with_sample(
@@ -273,8 +278,8 @@ async def query_by_conditions(
     RETURN DISTINCT b.name AS 品牌, s.name AS 车系, m.车名 AS 车型,
            m.`官方指导价` AS 指导价, p.name AS 价格区间,
            coalesce(e.name, m.能源类型) AS 能源类型, m.级别 AS 级别,
-           m.`上市时间` AS 上市时间
-    ORDER BY m.`上市时间` DESC, m.车名
+           m.`上市时间` AS 上市时间, m.launch_ym AS 上市年月
+    ORDER BY 上市年月 IS NULL, 上市年月 DESC, m.车名
     LIMIT $limit
     """
     return await _query_with_sample(cypher, params, "query_by_conditions")
@@ -291,13 +296,13 @@ async def compare_models(brand: str, limit: QueryLimit = 500) -> dict | str:
     RETURN DISTINCT b.name AS 品牌, s.name AS 车系, m.车名 AS 车型,
            m.`官方指导价` AS 指导价, p.name AS 价格区间,
            coalesce(e.name, m.能源类型) AS 能源类型, m.级别 AS 级别,
-           m.`上市时间` AS 上市时间,
-           m.`纯电续航里程(km)CLTC` AS 纯电续航,
-           m.`官方百公里加速时间(s)` AS 百公里加速,
+           m.`上市时间` AS 上市时间, m.launch_ym AS 上市年月,
+           m.range_cltc_km AS 纯电续航,
+           m.accel_100_s AS 百公里加速,
            m.`长x宽x高(mm)` AS 车身尺寸, m.`车身结构` AS 车身结构,
-           m.`整车保修期限` AS 保修期限,
-           m.`6万公里保养总成本预估` AS 保养成本
-    ORDER BY m.`上市时间` DESC, m.车名
+           m.warranty_years AS 保修年数, m.warranty_km AS 保修公里数,
+           m.maintenance_60k_cost AS 保养成本
+    ORDER BY 上市年月 IS NULL, 上市年月 DESC, m.车名
     LIMIT $limit
     """
     return await _query_with_sample(cypher, {"brand": brand.strip(), "limit": limit}, "compare_models")
@@ -314,17 +319,16 @@ async def query_by_maintenance_cost(
     cypher = """
     MATCH (m:车型)-[:IN_PRICE_RANGE]->(p:价格区间)
     WHERE p.name IN $price_ranges
-      AND m.`6万公里保养总成本预估` IS NOT NULL
-      AND NOT m.`6万公里保养总成本预估` IN ['NONE', 'None', '']
+      AND m.maintenance_60k_cost IS NOT NULL
     MATCH (s:车系)-[:HAS_MODEL]->(m)
     MATCH (b:品牌)-[:HAS_SERIES]->(s)
     OPTIONAL MATCH (m)-[:ENERGY_TYPE_IS]->(e:能源类型)
     RETURN DISTINCT b.name AS 品牌, s.name AS 车系, m.车名 AS 车型,
            m.`官方指导价` AS 指导价, p.name AS 价格区间,
-           m.`6万公里保养总成本预估` AS 保养成本,
+           m.maintenance_60k_cost AS 保养成本,
            coalesce(e.name, m.能源类型) AS 能源类型, m.级别 AS 级别,
            m.`上市时间` AS 上市时间
-    ORDER BY toFloat(replace(m.`6万公里保养总成本预估`, '元', '')) ASC
+    ORDER BY m.maintenance_60k_cost ASC
     LIMIT $limit
     """
     return await _query_with_sample(

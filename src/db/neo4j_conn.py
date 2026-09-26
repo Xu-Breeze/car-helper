@@ -63,16 +63,34 @@ class Neo4jConnection:
             logger.error("Failed to create Neo4j session: %s", exc)
             raise Neo4jConnectionError("数据库会话不可用，请稍后重试。") from exc
 
-    def ensure_indexes(self):
-        """Create optional lookup indexes when explicitly invoked by maintenance code."""
+    def ensure_indexes(self, *, await_online: bool = True, timeout_seconds: int = 600):
+        """Create the lookup indexes the importer and query tools depend on.
+
+        Without an index, ``MERGE``/``MATCH`` on these properties falls back to a
+        full label scan, which makes the import degrade into quadratic work and
+        appear to hang. Schema commands cannot run inside an explicit
+        transaction alongside data writes, so this uses its own auto-commit
+        session and must be called *before* the import transaction is opened.
+        """
         statements = (
+            "CREATE INDEX index_model_source_id IF NOT EXISTS FOR (m:车型) ON (m._source_id)",
+            "CREATE INDEX index_series_name IF NOT EXISTS FOR (s:车系) ON (s.name)",
             "CREATE INDEX index_brand_name IF NOT EXISTS FOR (b:品牌) ON (b.name)",
-            "CREATE INDEX index_price_name IF NOT EXISTS FOR (p:价格区间) ON (p.name)",
             "CREATE INDEX index_energy_name IF NOT EXISTS FOR (e:能源类型) ON (e.name)",
+            "CREATE INDEX index_price_name IF NOT EXISTS FOR (p:价格区间) ON (p.name)",
         )
         with self.get_session() as session:
             for statement in statements:
                 session.run(statement).consume()
+            if await_online:
+                try:
+                    session.run(f"CALL db.awaitIndexes({int(timeout_seconds)})").consume()
+                except Exception:
+                    # A missing await only costs speed, never correctness: the
+                    # indexes still finish populating in the background.
+                    logger.warning(
+                        "等待索引 ONLINE 超时，导入可能变慢但不会失败。", exc_info=True
+                    )
 
     def close(self):
         self.close_if_initialized()

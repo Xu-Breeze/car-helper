@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 
 import {
   deleteMemory,
@@ -21,15 +21,43 @@ const CATEGORY_LABELS: Record<string, string> = {
   other: '其他'
 }
 
-export function MemoryPanel() {
+interface MemoryPanelProps {
+  /** 由父组件递增；每次变化都会重新拉取记忆数量（例如一轮对话结束后）。 */
+  refreshToken?: number
+}
+
+export function MemoryPanel({ refreshToken = 0 }: MemoryPanelProps) {
   const [open, setOpen] = useState(false)
   const [profile, setProfile] = useState<Profile | null>(null)
   const [memories, setMemories] = useState<LongTermMemory[]>([])
+  const [loaded, setLoaded] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [editingMemoryId, setEditingMemoryId] = useState<string | null>(null)
   const [draftValue, setDraftValue] = useState('')
   const [saving, setSaving] = useState(false)
+
+  // 挂载即拉一次，之后由 refreshToken 驱动重拉：按钮上的数字不必先点开面板
+  // 才出现，对话里新增或删除记忆后也能立即跟上。
+  useEffect(() => {
+    let cancelled = false
+    void (async () => {
+      try {
+        const [loadedProfile, loadedMemories] = await Promise.all([getProfile(), getMemories()])
+        if (cancelled) return
+        setProfile(loadedProfile)
+        setMemories(loadedMemories)
+      } catch (reason) {
+        // 面板尚未打开，静默失败即可，不要在界面上弹出无关错误。
+        console.error('Failed to load memories:', reason)
+      } finally {
+        if (!cancelled) setLoaded(true)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [refreshToken])
 
   const openPanel = async () => {
     setOpen(true)
@@ -41,6 +69,7 @@ export function MemoryPanel() {
       const [loadedProfile, loadedMemories] = await Promise.all([getProfile(), getMemories()])
       setProfile(loadedProfile)
       setMemories(loadedMemories)
+      setLoaded(true)
     } catch (reason) {
       console.error('Failed to load memories:', reason)
       setError('长期记忆加载失败，请稍后重试。')
@@ -105,7 +134,7 @@ export function MemoryPanel() {
         onClick={() => void openPanel()}
         className="px-5 py-3 border border-border bg-background text-sm hover:bg-foreground hover:text-background transition-all"
       >
-        Memory{profile ? ` (${memories.length})` : ''}
+        Memory{loaded ? ` (${memories.length})` : ''}
       </button>
 
       {open && (
